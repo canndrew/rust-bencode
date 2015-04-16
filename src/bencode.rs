@@ -193,9 +193,9 @@ extern crate rustc_serialize;
 
 use std::io::{self, Write};
 use std::fmt;
-use std::str;
+use std::str::{self, Utf8Error};
 use std::vec::Vec;
-use std::num::FromStrRadix;
+use std::num::{from_i64, FromStrRadix, ParseFloatError};
 
 use rustc_serialize as serialize;
 use rustc_serialize::Encodable;
@@ -305,7 +305,9 @@ pub trait ToBencode {
 }
 
 pub trait FromBencode {
-    fn from_bencode(&Bencode) -> Option<Self>;
+    type Err;
+
+    fn from_bencode(&Bencode) -> Result<Self, Self::Err>;
 }
 
 impl ToBencode for () {
@@ -315,16 +317,18 @@ impl ToBencode for () {
 }
 
 impl FromBencode for () {
-    fn from_bencode(bencode: &Bencode) -> Option<()> {
+    type Err = ();
+
+    fn from_bencode(bencode: &Bencode) -> Result<(), ()> {
         match bencode {
             &Bencode::ByteString(ref v) => {
                 if v.len() == 0 {
-                    Some(())
+                    Ok(())
                 } else {
-                    None
+                    Err(())
                 }
             }
-            _ => None
+            _ => Err(())
         }
     }
 }
@@ -339,11 +343,13 @@ impl<T: ToBencode> ToBencode for Option<T> {
 }
 
 impl<T: FromBencode> FromBencode for Option<T> {
-    fn from_bencode(bencode: &Bencode) -> Option<Option<T>> {
+    type Err = T::Err;
+
+    fn from_bencode(bencode: &Bencode) -> Result<Option<T>, T::Err> {
         match bencode {
             &Bencode::ByteString(ref v) => {
                 if v == b"nil" {
-                    return Some(None)
+                    return Ok(None)
                 }
             }
             _ => ()
@@ -357,12 +363,22 @@ macro_rules! derive_num_to_bencode(($t:ty) => (
     }
 ));
 
+pub enum NumFromBencodeError {
+    OutOfRange(i64),
+    InvalidType,
+}
+
 macro_rules! derive_num_from_bencode(($t:ty) => (
     impl FromBencode for $t {
-        fn from_bencode(bencode: &Bencode) -> Option<$t> {
+        type Err = NumFromBencodeError;
+
+        fn from_bencode(bencode: &Bencode) -> Result<$t, NumFromBencodeError> {
             match bencode {
-                &Bencode::Number(v) => Some(v as $t),
-                _ => None
+                &Bencode::Number(v) => match from_i64::<$t>(v) {
+                    Some(n) => Ok(n),
+                    None    => Err(NumFromBencodeError::OutOfRange(v)),
+                },
+                _ => Err(NumFromBencodeError::InvalidType),
             }
         }
     }
@@ -404,16 +420,25 @@ impl ToBencode for f32 {
     }
 }
 
+pub enum FloatFromBencodeError {
+    ParseFloat(ParseFloatError),
+    FromUtf8(Utf8Error),
+    InvalidType,
+}
+
 impl FromBencode for f32 {
-    fn from_bencode(bencode: &Bencode) -> Option<f32> {
+    type Err = FloatFromBencodeError;
+
+    fn from_bencode(bencode: &Bencode) -> Result<f32, FloatFromBencodeError> {
+        use FloatFromBencodeError::*;
         match bencode {
             &Bencode::ByteString(ref v)  => {
                 match str::from_utf8(v) {
-                    Ok(s) => FromStrRadix::from_str_radix(s, 16).ok(),
-                    Err(..) => None
+                    Ok(s) => FromStrRadix::from_str_radix(s, 16).map_err(ParseFloat),
+                    Err(e) => Err(FromUtf8(e)),
                 }
             }
-            _ => None
+            _ => Err(InvalidType),
         }
     }
 }
@@ -425,15 +450,18 @@ impl ToBencode for f64 {
 }
 
 impl FromBencode for f64 {
-    fn from_bencode(bencode: &Bencode) -> Option<f64> {
+    type Err = FloatFromBencodeError;
+
+    fn from_bencode(bencode: &Bencode) -> Result<f64, FloatFromBencodeError> {
+        use FloatFromBencodeError::*;
         match bencode {
             &Bencode::ByteString(ref v)  => {
                 match str::from_utf8(v) {
-                    Ok(s) => FromStrRadix::from_str_radix(s, 16).ok(),
-                    Err(..) => None
+                    Ok(s) => FromStrRadix::from_str_radix(s, 16).map_err(ParseFloat),
+                    Err(e) => Err(FromUtf8(e)),
                 }
             }
-            _ => None
+            _ => Err(InvalidType),
         }
     }
 }
@@ -449,18 +477,20 @@ impl ToBencode for bool {
 }
 
 impl FromBencode for bool {
-    fn from_bencode(bencode: &Bencode) -> Option<bool> {
+    type Err = ();
+
+    fn from_bencode(bencode: &Bencode) -> Result<bool, ()> {
         match bencode {
             &Bencode::ByteString(ref v) => {
                 if v == b"true" {
-                    Some(true)
+                    Ok(true)
                 } else if v == b"false" {
-                    Some(false)
+                    Ok(false)
                 } else {
-                    None
+                    Err(())
                 }
             }
-            _ => None
+            _ => Err(())
         }
     }
 }
@@ -471,16 +501,34 @@ impl ToBencode for char {
     }
 }
 
+pub enum CharFromBencodeError {
+    FromUtf8(Utf8Error),
+    EmptyString,
+    MultipleChars,
+    InvalidType,
+}
+
 impl FromBencode for char {
-    fn from_bencode(bencode: &Bencode) -> Option<char> {
-        let s: Option<String> = FromBencode::from_bencode(bencode);
-        s.and_then(|s| {
-            if s.chars().count() == 1 {
-                Some(s.chars().next().unwrap())
-            } else {
-                None
+    type Err = CharFromBencodeError;
+
+    fn from_bencode(bencode: &Bencode) -> Result<char, CharFromBencodeError> {
+        let s: Result<String, StringFromBencodeError> = FromBencode::from_bencode(bencode);
+        match s {
+            Ok(s) => {
+                let mut it = s.chars();
+                match it.next() {
+                    None  => Err(CharFromBencodeError::EmptyString),
+                    Some(c) => match it.next() {
+                        None    => Ok(c),
+                        Some(_) => Err(CharFromBencodeError::MultipleChars),
+                    }
+                }
+            },
+            Err(e)  => match e {
+                StringFromBencodeError::FromUtf8(e) => Err(CharFromBencodeError::FromUtf8(e)),
+                StringFromBencodeError::InvalidType => Err(CharFromBencodeError::InvalidType),
             }
-        })
+        }
     }
 }
 
@@ -488,11 +536,19 @@ impl ToBencode for String {
     fn to_bencode(&self) -> Bencode { Bencode::ByteString(self.as_bytes().to_vec()) }
 }
 
+pub enum StringFromBencodeError {
+    FromUtf8(Utf8Error),
+    InvalidType,
+}
+
 impl FromBencode for String {
-    fn from_bencode(bencode: &Bencode) -> Option<String> {
+    type Err = StringFromBencodeError;
+
+    fn from_bencode(bencode: &Bencode) -> Result<String, StringFromBencodeError> {
+        use StringFromBencodeError::*;
         match bencode {
-            &Bencode::ByteString(ref v) => std::str::from_utf8(v).map(|s| s.to_string()).ok(),
-            _ => None
+            &Bencode::ByteString(ref v) => std::str::from_utf8(v).map(|s| s.to_string()).map_err(FromUtf8),
+            _ => Err(InvalidType),
         }
     }
 }
@@ -501,20 +557,27 @@ impl<T: ToBencode> ToBencode for Vec<T> {
     fn to_bencode(&self) -> Bencode { Bencode::List(self.iter().map(|e| e.to_bencode()).collect()) }
 }
 
+pub enum VecFromBencodeError<E> {
+    Underlying(E),
+    InvalidType,
+}
+
 impl<T: FromBencode> FromBencode for Vec<T> {
-    fn from_bencode(bencode: &Bencode) -> Option<Vec<T>> {
+    type Err = VecFromBencodeError<T::Err>;
+
+    fn from_bencode(bencode: &Bencode) -> Result<Vec<T>, VecFromBencodeError<T::Err>> {
         match bencode {
             &Bencode::List(ref es) => {
                 let mut list = Vec::new();
                 for e in es.iter() {
                     match FromBencode::from_bencode(e) {
-                        Some(v) => list.push(v),
-                        None => return None
+                        Ok(v) => list.push(v),
+                        Err(e) => return Err(VecFromBencodeError::Underlying(e)),
                     }
                 }
-                Some(list)
+                Ok(list)
             }
-            _ => None
+            _ => Err(VecFromBencodeError::InvalidType),
         }
     }
 }
@@ -529,6 +592,12 @@ macro_rules! map_to_bencode {
     }}
 }
 
+pub enum MapFromBencodeError<E> {
+    Underlying(E),
+    KeyInvalidUtf8(Utf8Error),
+    InvalidType,
+}
+
 macro_rules! map_from_bencode {
     ($mty:ident, $bencode:expr) => {{
         let res = match $bencode {
@@ -537,18 +606,18 @@ macro_rules! map_from_bencode {
                 for (key, value) in map.iter() {
                     match str::from_utf8(key.as_slice()) {
                         Ok(k) => {
-                            let val: Option<T> = FromBencode::from_bencode(value);
+                            let val: Result<T, T::Err> = FromBencode::from_bencode(value);
                             match val {
-                                Some(v) => m.insert(k.to_string(), v),
-                                None => return None
+                                Ok(v) => m.insert(k.to_string(), v),
+                                Err(e) => return Err(MapFromBencodeError::Underlying(e)),
                             }
                         }
-                        Err(..) => return None
+                        Err(e) => return Err(MapFromBencodeError::KeyInvalidUtf8(e)),
                     };
                 }
-                Some(m)
+                Ok(m)
             }
-            _ => None
+            _ => Err(MapFromBencodeError::InvalidType),
         };
         res
     }}
@@ -561,7 +630,8 @@ impl<T: ToBencode> ToBencode for BTreeMap<String, T> {
 }
 
 impl<T: FromBencode> FromBencode for BTreeMap<String, T> {
-    fn from_bencode(bencode: &Bencode) -> Option<BTreeMap<String, T>> {
+    type Err = MapFromBencodeError<T::Err>;
+    fn from_bencode(bencode: &Bencode) -> Result<BTreeMap<String, T>, MapFromBencodeError<T::Err>> {
         map_from_bencode!(BTreeMap, bencode)
     }
 }
@@ -573,7 +643,8 @@ impl<T: ToBencode> ToBencode for HashMap<String, T> {
 }
 
 impl<T: FromBencode> FromBencode for HashMap<String, T> {
-    fn from_bencode(bencode: &Bencode) -> Option<HashMap<String, T>> {
+    type Err = MapFromBencodeError<T::Err>;
+    fn from_bencode(bencode: &Bencode) -> Result<HashMap<String, T>, MapFromBencodeError<T::Err>> {
         map_from_bencode!(HashMap, bencode)
     }
 }
@@ -964,7 +1035,7 @@ impl<'a> Decoder<'a> {
 
     fn try_read<T: FromBencode>(&mut self, ty: &'static str) -> DecoderResult<T> {
         let val = self.stack.pop();
-        match val.and_then(|b| FromBencode::from_bencode(b)) {
+        match val.and_then(|b| FromBencode::from_bencode(b).ok()) {
             Some(v) => Ok(v),
             None => Err(Message(format!("Error decoding value as '{}': {:?}", ty, val)))
         }
