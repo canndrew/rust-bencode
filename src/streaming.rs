@@ -408,7 +408,6 @@ impl<'s> BorrowedStreamingParser<'s> {
 
     #[inline(always)]
     fn parse_event(&mut self) -> Result<BorrowedBencodeEvent<'s>, Error> {
-        println!("Parsing event yo! {:?}", self.curr_char());
         match self.curr_char() {
             Some('i') => {
                 check_nesting!(self);
