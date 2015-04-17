@@ -108,12 +108,19 @@
 
   use std::collections::BTreeMap;
 
-  use bencode::{FromBencode, ToBencode, Bencode};
+  use bencode::{FromBencode, ToBencode, Bencode, NumFromBencodeError};
   use bencode::util::ByteString;
 
   #[derive(PartialEq)]
   struct MyStruct {
       a: i32
+  }
+
+  #[derive(Debug)]
+  enum MyError {
+      NotADict,
+      DoesntContainA,
+      ANotANumber(NumFromBencodeError),
   }
 
   impl ToBencode for MyStruct {
@@ -125,17 +132,20 @@
   }
 
   impl FromBencode for MyStruct {
-      fn from_bencode(bencode: &bencode::Bencode) -> Option<MyStruct> {
+      type Err = MyError;
+
+      fn from_bencode(bencode: &bencode::Bencode) -> Result<MyStruct, MyError> {
+          use MyError::*;
           match bencode {
               &Bencode::Dict(ref m) => {
                   match m.get(&ByteString::from_str("a")) {
                       Some(a) => FromBencode::from_bencode(a).map(|a| {
                           MyStruct{ a: a }
-                      }),
-                      _ => None
+                      }).map_err(ANotANumber),
+                      _ => Err(DoesntContainA)
                   }
               }
-              _ => None
+              _ => Err(NotADict)
           }
       }
   }
@@ -363,6 +373,7 @@ macro_rules! derive_num_to_bencode(($t:ty) => (
     }
 ));
 
+#[derive(Debug)]
 pub enum NumFromBencodeError {
     OutOfRange(i64),
     InvalidType,
@@ -420,6 +431,7 @@ impl ToBencode for f32 {
     }
 }
 
+#[derive(Debug)]
 pub enum FloatFromBencodeError {
     ParseFloat(ParseFloatError),
     FromUtf8(Utf8Error),
@@ -501,6 +513,7 @@ impl ToBencode for char {
     }
 }
 
+#[derive(Debug)]
 pub enum CharFromBencodeError {
     FromUtf8(Utf8Error),
     EmptyString,
@@ -536,6 +549,7 @@ impl ToBencode for String {
     fn to_bencode(&self) -> Bencode { Bencode::ByteString(self.as_bytes().to_vec()) }
 }
 
+#[derive(Debug)]
 pub enum StringFromBencodeError {
     FromUtf8(Utf8Error),
     InvalidType,
@@ -557,6 +571,7 @@ impl<T: ToBencode> ToBencode for Vec<T> {
     fn to_bencode(&self) -> Bencode { Bencode::List(self.iter().map(|e| e.to_bencode()).collect()) }
 }
 
+#[derive(Debug)]
 pub enum VecFromBencodeError<E> {
     Underlying(E),
     InvalidType,
@@ -592,6 +607,7 @@ macro_rules! map_to_bencode {
     }}
 }
 
+#[derive(Debug)]
 pub enum MapFromBencodeError<E> {
     Underlying(E),
     KeyInvalidUtf8(Utf8Error),
