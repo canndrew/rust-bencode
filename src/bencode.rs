@@ -488,10 +488,16 @@ impl ToBencode for bool {
     }
 }
 
-impl FromBencode for bool {
-    type Err = ();
+#[derive(Debug)]
+pub enum BoolFromBencodeError {
+    NotAString,
+    InvalidString(Vec<u8>),
+}
 
-    fn from_bencode(bencode: &Bencode) -> Result<bool, ()> {
+impl FromBencode for bool {
+    type Err = BoolFromBencodeError;
+
+    fn from_bencode(bencode: &Bencode) -> Result<bool, BoolFromBencodeError> {
         match bencode {
             &Bencode::ByteString(ref v) => {
                 if v == b"true" {
@@ -499,10 +505,10 @@ impl FromBencode for bool {
                 } else if v == b"false" {
                     Ok(false)
                 } else {
-                    Err(())
+                    Err(BoolFromBencodeError::InvalidString(v.clone()))
                 }
             }
-            _ => Err(())
+            _ => Err(BoolFromBencodeError::NotAString)
         }
     }
 }
