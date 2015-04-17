@@ -215,9 +215,8 @@ use std::collections::HashMap;
 
 use streaming::{StreamingParser, Error};
 use streaming::BencodeEvent;
-use streaming::BencodeEvent::{NumberValue, ByteStringValue, ListStart, ListEnd,
-                              DictStart, DictKey, DictEnd, ParseError};
-use self::Bencode::{Empty, Number, ByteString, List, Dict};
+use streaming::{BorrowedStreamingParser, BorrowedBencodeEvent};
+  
 use self::DecoderError::{Message, Unimplemented, Expecting, StringEncoding};
 
 pub mod streaming;
@@ -238,6 +237,18 @@ pub enum Bencode {
     ByteString(Vec<u8>),
     List(ListVec),
     Dict(DictMap),
+}
+
+pub type BorrowedListVec<'s> = Vec<BorrowedBencode<'s>>;
+pub type BorrowedDictMap<'s> = (BTreeMap<&'s [u8], BorrowedBencode<'s>>, &'s [u8]);
+
+#[derive(PartialEq, Clone, Debug)]
+pub enum BorrowedBencode<'s> {
+  Empty,
+  Number(i64),
+  ByteString(&'s [u8]),
+  List(BorrowedListVec<'s>),
+  Dict(BorrowedDictMap<'s>),
 }
 
 impl fmt::Display for Bencode {
@@ -310,6 +321,25 @@ impl Encodable for Bencode {
     }
 }
 
+impl<'s> BorrowedBencode<'s> {
+    pub fn to_writer(&self, writer: &mut io::Write) -> io::Result<()> {
+        let mut encoder = Encoder::new(writer);
+        self.encode(&mut encoder)
+    }
+}
+
+impl<'s> Encodable for BorrowedBencode<'s> {
+    fn encode<S: serialize::Encoder>(&self, e: &mut S) -> Result<(), S::Error> {
+        match self {
+            &BorrowedBencode::Empty => Ok(()),
+            &BorrowedBencode::Number(v) => e.emit_i64(v),
+            &BorrowedBencode::ByteString(ref v) => e.emit_str(unsafe { str::from_utf8_unchecked(v) }),
+            &BorrowedBencode::List(ref v) => v.encode(e),
+            &BorrowedBencode::Dict((ref v, _)) => v.encode(e)
+        }
+    }
+}
+
 pub trait ToBencode {
     fn to_bencode(&self) -> Bencode;
 }
@@ -318,6 +348,12 @@ pub trait FromBencode {
     type Err;
 
     fn from_bencode(&Bencode) -> Result<Self, Self::Err>;
+}
+
+pub trait FromBorrowedBencode {
+    type Err;
+
+    fn from_borrowed_bencode<'s>(&BorrowedBencode<'s>) -> Result<Self, Self::Err>;
 }
 
 impl ToBencode for () {
@@ -685,6 +721,12 @@ pub fn from_iter<T: Iterator<Item=u8>>(iter: T) -> Result<Bencode, Error> {
     parser.parse()
 }
 
+pub fn borrowed_from_buffer<'s>(buf: &'s [u8]) -> Result<BorrowedBencode<'s>, Error> {
+    let borrowed_parser = BorrowedStreamingParser::new(buf);
+    let mut parser = BorrowedParser::new(borrowed_parser);
+    parser.parse()
+}
+
 pub fn encode<T: serialize::Encodable>(t: T) -> io::Result<Vec<u8>> {
     let mut w = vec![];
     {
@@ -956,12 +998,12 @@ impl<T: Iterator<Item=BencodeEvent>> Parser<T> {
 
     fn parse_elem(&mut self, current: Option<BencodeEvent>) -> Result<Bencode, Error> {
         let res = match current {
-            Some(NumberValue(v)) => Ok(Bencode::Number(v)),
-            Some(ByteStringValue(v)) => Ok(Bencode::ByteString(v)),
-            Some(ListStart) => self.parse_list(current),
-            Some(DictStart) => self.parse_dict(current),
-            Some(ParseError(err)) => Err(err),
-            None => Ok(Empty),
+            Some(BencodeEvent::NumberValue(v)) => Ok(Bencode::Number(v)),
+            Some(BencodeEvent::ByteStringValue(v)) => Ok(Bencode::ByteString(v)),
+            Some(BencodeEvent::ListStart) => self.parse_list(current),
+            Some(BencodeEvent::DictStart) => self.parse_dict(current),
+            Some(BencodeEvent::ParseError(err)) => Err(err),
+            None => Ok(Bencode::Empty),
             x => panic!("[root] Unreachable but got {:?}", x)
         };
         if self.depth == 0 {
@@ -970,7 +1012,7 @@ impl<T: Iterator<Item=BencodeEvent>> Parser<T> {
                 Err(_) => res,
                 _ => {
                     match next {
-                        Some(ParseError(err)) => Err(err),
+                        Some(BencodeEvent::ParseError(err)) => Err(err),
                         None => res,
                         x => panic!("Unreachable but got {:?}", x)
                     }
@@ -987,8 +1029,8 @@ impl<T: Iterator<Item=BencodeEvent>> Parser<T> {
         loop {
             current = self.reader.next();
             match current {
-                Some(ListEnd) => break,
-                Some(ParseError(err)) => return Err(err),
+                Some(BencodeEvent::ListEnd) => break,
+                Some(BencodeEvent::ParseError(err)) => return Err(err),
                 Some(_) => {
                     match self.parse_elem(current) {
                         Ok(v) => list.push(v),
@@ -1008,9 +1050,9 @@ impl<T: Iterator<Item=BencodeEvent>> Parser<T> {
         loop {
             current = self.reader.next();
             let key = match current {
-                Some(DictEnd) => break,
-                Some(DictKey(v)) => util::ByteString::from_vec(v),
-                Some(ParseError(err)) => return Err(err),
+                Some(BencodeEvent::DictEnd) => break,
+                Some(BencodeEvent::DictKey(v)) => util::ByteString::from_vec(v),
+                Some(BencodeEvent::ParseError(err)) => return Err(err),
                 x => panic!("[dict] Unreachable but got {:?}", x)
             };
             current = self.reader.next();
@@ -1022,13 +1064,103 @@ impl<T: Iterator<Item=BencodeEvent>> Parser<T> {
     }
 }
 
+pub struct BorrowedParser<T> {
+    reader: T,
+    depth: u32,
+}
+
+impl<'s, T: Iterator<Item=BorrowedBencodeEvent<'s>>> BorrowedParser<T> {
+    pub fn new(reader: T) -> BorrowedParser<T> {
+        BorrowedParser {
+            reader: reader,
+            depth: 0,
+        }
+    }
+
+    pub fn parse(&mut self) -> Result<BorrowedBencode<'s>, Error> {
+        let next = self.reader.next();
+        self.parse_elem(next)
+    }
+
+    pub fn parse_elem(&mut self, current: Option<BorrowedBencodeEvent<'s>>) -> Result<BorrowedBencode<'s>, Error> {
+        let res = match current {
+            Some(BorrowedBencodeEvent::NumberValue(v)) => Ok(BorrowedBencode::Number(v)),
+            Some(BorrowedBencodeEvent::ByteStringValue(v)) => Ok(BorrowedBencode::ByteString(v)),
+            Some(BorrowedBencodeEvent::ListStart) => self.parse_list(current),
+            Some(BorrowedBencodeEvent::DictStart) => self.parse_dict(current),
+            Some(BorrowedBencodeEvent::ParseError(err)) => Err(err),
+            None => Ok(BorrowedBencode::Empty),
+            x => panic!("[root] Unreachable but got {:?}", x)
+        };
+        if self.depth == 0 {
+            let next = self.reader.next();
+            match res {
+                Err(_) => res,
+                _ => {
+                    match next {
+                        Some(BorrowedBencodeEvent::ParseError(err)) => Err(err),
+                        None => res,
+                        x => panic!("Unreachable but got {:?}", x)
+                    }
+                }
+            }
+        } else {
+            res
+        }
+    }
+
+    fn parse_list(&mut self, mut current: Option<BorrowedBencodeEvent<'s>>) -> Result<BorrowedBencode<'s>, Error> {
+        self.depth += 1;
+        let mut list = Vec::new();
+        loop {
+            current = self.reader.next();
+            match current {
+                Some(BorrowedBencodeEvent::ListEnd) => break,
+                Some(BorrowedBencodeEvent::ParseError(err)) => return Err(err),
+                Some(_) => {
+                    match self.parse_elem(current) {
+                        Ok(v) => list.push(v),
+                        err@Err(_) => return err
+                    }
+                }
+                x => panic!("[list] Unreachable but got {:?}", x)
+            }
+        }
+        self.depth -= 1;
+        Ok(BorrowedBencode::List(list))
+    }
+
+    fn parse_dict(&mut self, mut current: Option<BorrowedBencodeEvent<'s>>) -> Result<BorrowedBencode<'s>, Error> {
+        self.depth += 1;
+        let mut map = BTreeMap::new();
+        let mut dict_slice: &'s [u8];
+        loop {
+            current = self.reader.next();
+            let key = match current {
+                Some(BorrowedBencodeEvent::DictEnd(slice)) => {
+                  dict_slice = slice;
+                  break;
+                },
+                Some(BorrowedBencodeEvent::DictKey(v)) => v,
+                Some(BorrowedBencodeEvent::ParseError(err)) => return Err(err),
+                x => panic!("[dict] Unreachable but got {:?}", x)
+            };
+            current = self.reader.next();
+            let value = try!(self.parse_elem(current));
+            map.insert(key, value);
+        }
+        self.depth -= 1;
+        Ok(BorrowedBencode::Dict((map, dict_slice)))
+    }
+}
+
 macro_rules! dec_expect_value(($slf:expr) => {
     if $slf.expect_key {
         return Err(Message("Only 'string' map keys allowed".to_string()))
     }
 });
 
-static EMPTY: Bencode = Empty;
+static EMPTY: Bencode = Bencode::Empty;
 
 #[derive(Eq, PartialEq, Clone, Debug)]
 pub enum DecoderError {

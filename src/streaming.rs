@@ -1,7 +1,3 @@
-use self::BencodePosition::{ListPosition, KeyPosition, ValuePosition};
-use self::BencodeEvent::{NumberValue, ByteStringValue, ListStart, ListEnd,
-                         DictStart, DictKey, DictEnd, ParseError};
-
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub enum BencodeEvent {
     NumberValue(i64),
@@ -16,7 +12,7 @@ pub enum BencodeEvent {
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct Error {
-    pub pos: u32,
+    pub pos: usize,
     pub msg: String,
 }
 
@@ -29,8 +25,8 @@ pub enum BencodePosition {
 
 pub struct StreamingParser<T> {
     reader: T,
-    pos: u32,
-    decoded: u32,
+    pos: usize,
+    decoded: usize,
     end: bool,
     curr: Option<u8>,
     stack: Vec<BencodePosition>,
@@ -88,7 +84,7 @@ impl<T: Iterator<Item=u8>> StreamingParser<T> {
         self.curr.map(|v| v as char)
     }
 
-    fn error<R>(&mut self, expected: String) -> Result<R, Error> {
+    fn error<R>(&mut self, expected: &str) -> Result<R, Error> {
         let got = self.curr_char();
         let got_char = match got {
             Some(x) => alphanum_to_str(x),
@@ -114,7 +110,7 @@ impl<T: Iterator<Item=u8>> StreamingParser<T> {
             _ => 1
         };
         let num = try!(self.parse_number_digits(sign));
-        expect!(self, 'e', "e".to_string());
+        expect!(self, 'e', "e");
         Ok(num)
     }
 
@@ -132,7 +128,7 @@ impl<T: Iterator<Item=u8>> StreamingParser<T> {
                     self.next_byte();
                 }
             }
-            _ => return self.error("0-9".to_string())
+            _ => return self.error("0-9")
         };
         Ok(num)
     }
@@ -145,7 +141,7 @@ impl<T: Iterator<Item=u8>> StreamingParser<T> {
     #[inline(always)]
     fn parse_bytestring(&mut self) -> Result<Vec<u8>, Error> {
         let len = try!(self.parse_number_digits(1));
-        expect!(self, ':', ":".to_string());
+        expect!(self, ':', ":");
         let bytes = try!(self.next_bytes(len as usize));
         Ok(bytes)
     }
@@ -154,9 +150,9 @@ impl<T: Iterator<Item=u8>> StreamingParser<T> {
     fn parse_end(&mut self) -> Result<BencodeEvent, Error> {
         self.next_byte();
         match self.stack.pop() {
-            Some(ListPosition) => Ok(ListEnd),
-            Some(ValuePosition) => {
-                Ok(DictEnd)
+            Some(BencodePosition::ListPosition) => Ok(BencodeEvent::ListEnd),
+            Some(BencodePosition::ValuePosition) => {
+                Ok(BencodeEvent::DictEnd)
             }
             _ => return self.error_msg("Unmatched value ending".to_string())
         }
@@ -169,10 +165,10 @@ impl<T: Iterator<Item=u8>> StreamingParser<T> {
             Some('0' ... '9') => {
                 self.decoded += 1;
                 let res = try!(self.parse_bytestring());
-                Ok(DictKey(res))
+                Ok(BencodeEvent::DictKey(res))
             }
             Some('e') => self.parse_end(),
-            _ => self.error("0-9 or e".to_string())
+            _ => self.error("0-9 or e")
         }
     }
 
@@ -184,30 +180,30 @@ impl<T: Iterator<Item=u8>> StreamingParser<T> {
                 self.next_byte();
                 self.decoded += 1;
                 let res = try!(self.parse_number());
-                Ok(NumberValue(res))
+                Ok(BencodeEvent::NumberValue(res))
             }
             Some('0' ... '9') => {
                 check_nesting!(self);
                 self.decoded += 1;
                 let res = try!(self.parse_bytestring());
-                Ok(ByteStringValue(res))
+                Ok(BencodeEvent::ByteStringValue(res))
             }
             Some('l') => {
                 check_nesting!(self);
                 self.next_byte();
                 self.decoded += 1;
-                self.stack.push(ListPosition);
-                Ok(ListStart)
+                self.stack.push(BencodePosition::ListPosition);
+                Ok(BencodeEvent::ListStart)
             }
             Some('d') => {
                 check_nesting!(self);
                 self.next_byte();
                 self.decoded += 1;
-                self.stack.push(KeyPosition);
-                Ok(DictStart)
+                self.stack.push(BencodePosition::KeyPosition);
+                Ok(BencodeEvent::DictStart)
             }
             Some('e') => self.parse_end(),
-            _ => self.error("i or 0-9 or l or d or e".to_string())
+            _ => self.error("i or 0-9 or l or d or e")
         }
     }
 
@@ -223,13 +219,13 @@ impl<T: Iterator<Item=u8>> Iterator for StreamingParser<T> {
             return None
         }
         let result = match self.stack.pop() {
-            Some(KeyPosition) => {
-                self.stack.push(ValuePosition);
+            Some(BencodePosition::KeyPosition) => {
+                self.stack.push(BencodePosition::ValuePosition);
                 self.parse_key()
             }
             pos => {
                 match pos {
-                    Some(ValuePosition) => self.stack.push(KeyPosition),
+                    Some(BencodePosition::ValuePosition) => self.stack.push(BencodePosition::KeyPosition),
                     Some(_) => self.stack.push(pos.unwrap()),
                     None => {}
                 }
@@ -240,7 +236,7 @@ impl<T: Iterator<Item=u8>> Iterator for StreamingParser<T> {
             Ok(ev) => Some(ev),
             Err(err) => {
                 self.end = true;
-                Some(ParseError(err))
+                Some(BencodeEvent::ParseError(err))
             }
         }
     }
@@ -251,6 +247,233 @@ fn alphanum_to_str(ch: char) -> String {
         ch.to_string()
     } else {
         (ch as u8).to_string()
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub enum BorrowedBencodeEvent<'s> {
+    NumberValue(i64),
+    ByteStringValue(&'s [u8]),
+    ListStart,
+    ListEnd,
+    DictStart,
+    DictKey(&'s [u8]),
+    DictEnd(&'s [u8]),
+    ParseError(Error),
+}
+
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub enum BorrowedBencodePosition {
+    ListPosition,
+    KeyPosition(usize),
+    ValuePosition(usize),
+}
+
+pub struct BorrowedStreamingParser<'s> {
+  data: &'s [u8],
+  pos: usize,
+  decoded: usize,
+  end: bool,
+  stack: Vec<BorrowedBencodePosition>,
+}
+
+impl<'s> BorrowedStreamingParser<'s> {
+    pub fn new(data: &'s[u8]) -> BorrowedStreamingParser<'s> {
+        BorrowedStreamingParser {
+            data: data,
+            pos: 0,
+            decoded: 0,
+            end: data.len() == 0,
+            stack: Vec::new(),
+        }
+    }
+
+    fn next_byte(&mut self) {
+        if !self.end {
+            self.pos += 1;
+            self.end = self.data.len() == self.pos;
+        }
+    }
+
+    fn next_bytes(&mut self, len: usize) -> Result<&'s [u8], Error> {
+        let remaining = self.data.len() - self.pos;
+        if len <= remaining {
+            let old_pos = self.pos;
+            self.pos += len;
+            Ok(&self.data[old_pos .. self.pos])
+        }
+        else {
+            self.pos = self.data.len();
+            self.error_msg(format!("Expecting {} bytes but only got {}", len, remaining))
+        }
+    }
+
+    #[inline(always)]
+    fn curr_char(&mut self) -> Option<char> {
+        if self.end {
+            None
+        }
+        else {
+            Some(self.data[self.pos] as char)
+        }
+    }
+
+    fn error<R>(&mut self, expected: &str) -> Result<R, Error> {
+        let got = self.curr_char();
+        let got_char = match got {
+            Some(x) => alphanum_to_str(x),
+            None => "EOF".to_string()
+        };
+        self.error_msg(format!("Expecting '{}' but got '{}'", expected, got_char))
+    }
+
+    fn error_msg<R>(&mut self, msg: String) -> Result<R, Error> {
+        Err(Error {
+            pos: self.pos,
+            msg: msg
+        })
+    }
+
+    #[inline(always)]
+    fn parse_number(&mut self) -> Result<i64, Error> {
+        let sign = match self.curr_char() {
+            Some('-') => {
+                self.next_byte();
+                -1
+            }
+            _ => 1
+        };
+        let num = try!(self.parse_number_digits(sign));
+        expect!(self, 'e', "e");
+        Ok(num)
+    }
+
+    #[inline(always)]
+    fn parse_number_digits(&mut self, sign: i64) -> Result<i64, Error> {
+        let mut num = 0;
+        match self.curr_char() {
+            Some('0') => self.next_byte(),
+            Some('1' ... '9') => {
+                loop {
+                    match self.curr_char() {
+                        Some(ch @ '0' ... '9') => self.parse_digit(ch, sign, &mut num),
+                        _ => break
+                    }
+                    self.next_byte();
+                }
+            }
+            _ => return self.error("0-9")
+        };
+        Ok(num)
+    }
+
+    #[inline(always)]
+    fn parse_digit(&self, ch: char, sign: i64, num: &mut i64) {
+        *num = *num*10 + sign*ch.to_digit(10).unwrap() as i64;
+    }
+
+    #[inline(always)]
+    fn parse_bytestring(&mut self) -> Result<&'s [u8], Error> {
+        let len = try!(self.parse_number_digits(1));
+        expect!(self, ':', ":");
+        let bytes = try!(self.next_bytes(len as usize));
+        Ok(bytes)
+    }
+
+    #[inline(always)]
+    fn parse_end(&mut self) -> Result<BorrowedBencodeEvent<'s>, Error> {
+        self.next_byte();
+        match self.stack.pop() {
+            Some(BorrowedBencodePosition::ListPosition) => Ok(BorrowedBencodeEvent::ListEnd),
+            Some(BorrowedBencodePosition::ValuePosition(pos)) => {
+                Ok(BorrowedBencodeEvent::DictEnd(&self.data[pos .. self.pos]))
+            }
+            _ => return self.error_msg("Unmatched value ending".to_string())
+        }
+    }
+
+    #[inline(always)]
+    fn parse_key(&mut self) -> Result<BorrowedBencodeEvent<'s>, Error> {
+        check_nesting!(self);
+        match self.curr_char() {
+            Some('0' ... '9') => {
+                self.decoded += 1;
+                let res = try!(self.parse_bytestring());
+                Ok(BorrowedBencodeEvent::DictKey(res))
+            }
+            Some('e') => self.parse_end(),
+            _ => self.error("0-9 or e")
+        }
+    }
+
+    #[inline(always)]
+    fn parse_event(&mut self) -> Result<BorrowedBencodeEvent<'s>, Error> {
+        println!("Parsing event yo! {:?}", self.curr_char());
+        match self.curr_char() {
+            Some('i') => {
+                check_nesting!(self);
+                self.next_byte();
+                self.decoded += 1;
+                let res = try!(self.parse_number());
+                Ok(BorrowedBencodeEvent::NumberValue(res))
+            }
+            Some('0' ... '9') => {
+                check_nesting!(self);
+                self.decoded += 1;
+                let res = try!(self.parse_bytestring());
+                Ok(BorrowedBencodeEvent::ByteStringValue(res))
+            }
+            Some('l') => {
+                check_nesting!(self);
+                self.next_byte();
+                self.decoded += 1;
+                self.stack.push(BorrowedBencodePosition::ListPosition);
+                Ok(BorrowedBencodeEvent::ListStart)
+            }
+            Some('d') => {
+                check_nesting!(self);
+                self.next_byte();
+                self.decoded += 1;
+                self.stack.push(BorrowedBencodePosition::KeyPosition(self.pos - 1));
+                Ok(BorrowedBencodeEvent::DictStart)
+            }
+            Some('e') => self.parse_end(),
+            _ => self.error("i or 0-9 or l or d or e")
+        }
+    }
+
+    fn empty_input(&self) -> bool {
+        self.end && self.decoded == 0
+    }
+}
+
+impl<'s> Iterator for BorrowedStreamingParser<'s> {
+    type Item = BorrowedBencodeEvent<'s>;
+    fn next(&mut self) -> Option<BorrowedBencodeEvent<'s>> {
+        if self.end || self.empty_input() {
+            return None
+        }
+        let result = match self.stack.pop() {
+            Some(BorrowedBencodePosition::KeyPosition(pos)) => {
+                self.stack.push(BorrowedBencodePosition::ValuePosition(pos));
+                self.parse_key()
+            }
+            pos => {
+                match pos {
+                    Some(BorrowedBencodePosition::ValuePosition(pos)) => self.stack.push(BorrowedBencodePosition::KeyPosition(pos)),
+                    Some(_) => self.stack.push(pos.unwrap()),
+                    None => {}
+                }
+                self.parse_event()
+            }
+        };
+        match result {
+            Ok(ev) => Some(ev),
+            Err(err) => {
+                self.end = true;
+                Some(BorrowedBencodeEvent::ParseError(err))
+            }
+        }
     }
 }
 
